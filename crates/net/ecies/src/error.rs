@@ -97,6 +97,11 @@ pub enum ECIESErrorImpl {
     /// Error when data is not received from peer for a prolonged period.
     #[error("never received data from remote peer")]
     StreamTimeout,
+    /// Error when the ECIES cipher or MAC state is not initialized.
+    ///
+    /// This typically happens when trying to read/write messages before completing the handshake.
+    #[error("ECIES stream cipher not ready, handshake may not be complete")]
+    StreamCipherNotReady,
 }
 
 impl From<ECIESErrorImpl> for ECIESError {

@@ -626,24 +626,29 @@ impl ECIES {
     #[cfg(test)]
     fn create_header(&mut self, size: usize) -> BytesMut {
         let mut out = BytesMut::new();
-        self.write_header(&mut out, size);
+        self.write_header(&mut out, size).expect("cipher should be ready after handshake");
         out
     }
 
-    pub fn write_header(&mut self, out: &mut BytesMut, size: usize) {
+    pub fn write_header(&mut self, out: &mut BytesMut, size: usize) -> Result<(), ECIESError> {
         let mut buf = [0u8; 8];
         BigEndian::write_uint(&mut buf, size as u64, 3);
         let mut header = [0u8; 16];
         header[..3].copy_from_slice(&buf[..3]);
         header[3..6].copy_from_slice(&[194, 128, 128]);
 
-        self.egress_aes.as_mut().unwrap().apply_keystream(&mut header);
-        self.egress_mac.as_mut().unwrap().update_header(&header);
-        let tag = self.egress_mac.as_mut().unwrap().digest();
+        let egress_aes = self.egress_aes.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+        let egress_mac = self.egress_mac.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+
+        egress_aes.apply_keystream(&mut header);
+        egress_mac.update_header(&header);
+        let tag = egress_mac.digest();
 
         out.reserve(Self::header_len());
         out.extend_from_slice(&header[..]);
         out.extend_from_slice(tag.as_slice());
+
+        Ok(())
     }
 
     /// Reads the `RLPx` header from the slice, setting up the MAC and AES, returning the body
@@ -657,16 +662,20 @@ impl ECIES {
         }
 
         let (header_bytes, mac_bytes) = split_at_mut(data, 16)?;
-        let header: &mut [u8; 16] = header_bytes.try_into().unwrap();
+        let header: &mut [u8; 16] =
+            header_bytes.try_into().map_err(|_| ECIESErrorImpl::InvalidHeader)?;
         let mac = B128::from_slice(&mac_bytes[..16]);
 
-        self.ingress_mac.as_mut().unwrap().update_header(header);
-        let check_mac = self.ingress_mac.as_mut().unwrap().digest();
+        let ingress_mac = self.ingress_mac.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+
+        ingress_mac.update_header(header);
+        let check_mac = ingress_mac.digest();
         if check_mac != mac {
             return Err(ECIESErrorImpl::TagCheckHeaderFailed.into())
         }
 
-        self.ingress_aes.as_mut().unwrap().apply_keystream(header);
+        let ingress_aes = self.ingress_aes.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+        ingress_aes.apply_keystream(header);
         if header.len() < 3 {
             return Err(ECIESErrorImpl::InvalidHeader.into())
         }
@@ -682,19 +691,23 @@ impl ECIES {
         32
     }
 
-    pub const fn body_len(&self) -> usize {
-        let len = self.body_size.unwrap();
-        Self::align_16(len) + 16
+    /// Returns the expected body length for the current message, or `None` if
+    /// [`Self::read_header`] has not been called yet.
+    pub const fn body_len(&self) -> Option<usize> {
+        match self.body_size {
+            Some(len) => Some(Self::align_16(len) + 16),
+            None => None,
+        }
     }
 
     #[cfg(test)]
     fn create_body(&mut self, data: &[u8]) -> BytesMut {
         let mut out = BytesMut::new();
-        self.write_body(&mut out, data);
+        self.write_body(&mut out, data).expect("cipher should be ready after handshake");
         out
     }
 
-    pub fn write_body(&mut self, out: &mut BytesMut, data: &[u8]) {
+    pub fn write_body(&mut self, out: &mut BytesMut, data: &[u8]) -> Result<(), ECIESError> {
         let len = Self::align_16(data.len());
         let old_len = out.len();
         out.resize(old_len + len, 0);
@@ -702,11 +715,16 @@ impl ECIES {
         let encrypted = &mut out[old_len..old_len + len];
         encrypted[..data.len()].copy_from_slice(data);
 
-        self.egress_aes.as_mut().unwrap().apply_keystream(encrypted);
-        self.egress_mac.as_mut().unwrap().update_body(encrypted);
-        let tag = self.egress_mac.as_mut().unwrap().digest();
+        let egress_aes = self.egress_aes.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+        let egress_mac = self.egress_mac.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+
+        egress_aes.apply_keystream(encrypted);
+        egress_mac.update_body(encrypted);
+        let tag = egress_mac.digest();
 
         out.extend_from_slice(tag.as_slice());
+
+        Ok(())
     }
 
     pub fn read_body<'a>(&mut self, data: &'a mut [u8]) -> Result<&'a mut [u8], ECIESError> {
@@ -716,17 +734,22 @@ impl ECIES {
         let mac_index = data.len().checked_sub(16).ok_or(ECIESErrorImpl::EncryptedDataTooSmall)?;
         let (body, mac_bytes) = split_at_mut(data, mac_index)?;
         let mac = B128::from_slice(mac_bytes);
-        self.ingress_mac.as_mut().unwrap().update_body(body);
-        let check_mac = self.ingress_mac.as_mut().unwrap().digest();
+
+        let ingress_mac = self.ingress_mac.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+
+        ingress_mac.update_body(body);
+        let check_mac = ingress_mac.digest();
         if check_mac != mac {
             return Err(ECIESErrorImpl::TagCheckBodyFailed.into())
         }
 
-        let size = self.body_size.unwrap();
+        let size = self.body_size.ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
         self.body_size = None;
-        let ret = body;
-        self.ingress_aes.as_mut().unwrap().apply_keystream(ret);
-        Ok(split_at_mut(ret, size)?.0)
+
+        let ingress_aes = self.ingress_aes.as_mut().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+        ingress_aes.apply_keystream(body);
+
+        Ok(split_at_mut(body, size)?.0)
     }
 
     /// Returns `num` aligned to 16.
@@ -784,7 +807,7 @@ mod tests {
         assert_eq!(header.len(), ECIES::header_len());
         client_ecies.read_header(&mut header).unwrap();
         let mut body = server_ecies.create_body(&server_to_client_data);
-        assert_eq!(body.len(), client_ecies.body_len());
+        assert_eq!(body.len(), client_ecies.body_len().unwrap());
         let ret = client_ecies.read_body(&mut body).unwrap();
         assert_eq!(ret, server_to_client_data);
 

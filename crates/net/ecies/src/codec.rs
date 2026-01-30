@@ -131,11 +131,14 @@ impl Decoder for ECIESCodec {
                     self.state = ECIESState::Body;
                 }
                 ECIESState::Body => {
-                    if buf.len() < self.ecies.body_len() {
+                    let body_len =
+                        self.ecies.body_len().ok_or(ECIESErrorImpl::StreamCipherNotReady)?;
+
+                    if buf.len() < body_len {
                         return Ok(None)
                     }
 
-                    let mut data = buf.split_to(self.ecies.body_len());
+                    let mut data = buf.split_to(body_len);
                     let mut ret = BytesMut::new();
                     ret.extend_from_slice(self.ecies.read_body(&mut data)?);
 
@@ -164,8 +167,12 @@ impl Encoder<EgressECIESValue> for ECIESCodec {
                 Ok(())
             }
             EgressECIESValue::Message(data) => {
-                self.ecies.write_header(buf, data.len());
-                self.ecies.write_body(buf, &data);
+                self.ecies
+                    .write_header(buf, data.len())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                self.ecies
+                    .write_body(buf, &data)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(())
             }
         }
